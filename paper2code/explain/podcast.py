@@ -10,6 +10,28 @@ from ..tts import get_tts
 from ..tts.base import TTSEngine
 
 
+def _podcast_voice_notes(engine: TTSEngine) -> str:
+    """按实际落到的后端写音色说明，避免云端合成仍被记成 edge 韵律。"""
+    name = getattr(engine, "name", "") or ""
+    host = getattr(engine, "voice_a", "n/a")
+    guest = getattr(engine, "voice_b", "n/a")
+    if name in ("siliconflow", "openai_speech"):
+        return (
+            f"- 音色：主持人 {host} / 讲解人 {guest}\n"
+            f"- 模型：{getattr(engine, 'model', 'n/a')} @ {getattr(engine, 'base_url', 'n/a')}\n"
+            "- 切块：长对白按句送往 /v1/audio/speech；调用失败会回退本地链路并写入 warnings\n"
+        )
+    return (
+        f"- 音色：主持人 {host} / 讲解人 {guest}\n"
+        f"- 韵律：主持人 rate {getattr(engine, 'rate_a', 'n/a')} pitch {getattr(engine, 'pitch_a', 'n/a')}；\n"
+        f"  讲解人 rate {getattr(engine, 'rate_b', 'n/a')} pitch {getattr(engine, 'pitch_b', 'n/a')}；\n"
+        f"  问句加大 pitch {getattr(engine, 'q_pitch', 'n/a')}\n"
+        "- 逐句语气：问句抬升、感叹加重、转折压低、结论放慢、列举有节奏、短反应轻快；\n"
+        "  同一轮内逐句调整语速/音高，句间短停、轮次间长停\n"
+        f"- 轮次间停顿：{getattr(engine, 'pause', 'n/a')!r}\n"
+    )
+
+
 def build_podcast(
     paper: Paper,
     turns: List[Dict[str, str]],
@@ -29,6 +51,12 @@ def build_podcast(
     srt_path = out_dir / "podcast.srt"
     srt_path.write_text(srt_text, encoding="utf-8")
 
+    audio_path: Optional[str] = None
+    if audio:
+        audio_path = engine.synthesize(turns, out_dir / "podcast.mp3")
+
+    # 元信息放在合成**之后**：engine.name / 音色这些要说「实际用的是谁」，
+    # 而 auto 链要等真的合成完才知道落到哪个后端（siliconflow → edge → sapi → 占位）。
     meta_path = out_dir / "podcast_meta.md"
     meta_path.write_text(
         f"""# 播客元信息
@@ -37,15 +65,11 @@ def build_podcast(
 - 轮次：{len(turns)} 轮（主持人 / 讲解人 双人对谈）
 - 估算时长：约 {total / 60:.1f} 分钟
 - 字幕字符/秒：4.6（用于时长估算）
-- 音色：主持人 {getattr(engine, 'voice_a', 'n/a')} / 讲解人 {getattr(engine, 'voice_b', 'n/a')}
-- 合成引擎：{engine.name}
+{_podcast_voice_notes(engine)}- 合成引擎：{engine.name}
+- 音频产物：{audio_path or '（本次没有生成音频，原因见 manifest.warnings）'}
 """,
         encoding="utf-8",
     )
-
-    audio_path: Optional[str] = None
-    if audio:
-        audio_path = engine.synthesize(turns, out_dir / "podcast.mp3")
 
     return {
         "script": str(script_path),

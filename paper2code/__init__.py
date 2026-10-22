@@ -7,7 +7,7 @@
       llm/         可插拔大模型层（OpenAI 兼容 / 离线规则降级）
       explain/     讲解材料：课件（HTML 幻灯片）+ 知识播客（脚本/字幕/音频）
       reproduce/   复现结果：三种代码情形策略 + 表格图表重现 + 数值比对
-      tts/         语音合成适配层（edge-tts / 占位降级）
+      tts/         语音合成（SiliconFlow → edge-tts → SAPI → 占位）
       pipeline.py  端到端编排
       cli.py       命令行入口
       api.py       本地 Web 服务入口
