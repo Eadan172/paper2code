@@ -8,6 +8,9 @@
   - 代码链接：https://colab.research.google.com/drive/1lu1d-C0yRltKK_Wp-gF26oHcZSCiHaI8b（出处：link: https://colab.research.google.com/drive/1lu1d-C0yRltKK_Wp-gF26oHcZSCiHaI8b…）
   - 正文表述：computationally demanding methods and currently available ML/DL tools. The method was encoded into an application Python
 
+> 示例包说明：为控制体积与第三方许可，`reproduce/repo/` 的仓库克隆未随示例分发；
+> `repo_manifest.json` 保留了仓库 URL 与依赖信息，重新 `git clone` 即可复现。
+
 ## 一、复现策略
 
 论文附带开源代码，复现的第一原则是**复用而非重写**：以仓库自带的脚本与数据为准，我们只在外部做环境隔离、种子固定、产物采集与逐格对标。判据是数字级一致（默认相对误差 ≤5% 记为 pass）。失败通常来自依赖版本漂移或未固定的随机性。
