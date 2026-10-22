@@ -1,9 +1,14 @@
 """TTS 接口与实现选择。
 
-* ``EdgeTTSEngine``：使用 ``edge-tts``（微软 Edge 朗读服务），**免费、无需
-  API Key**，中文音色质量好，是本地 MVP 的首选。
-* ``NullTTSEngine``：无网络/未安装依赖时的降级实现，仍然产出字幕（SRT）与
-  文本稿，只是不生成音频，并把原因写入 warnings。
+有 TTS API Key 时优先走云端（听感最接近真人），失败再逐级回退，并把原因写入 warnings：
+
+* ``SiliconFlowTTSEngine``：SiliconFlow 的 OpenAI 兼容 ``POST /v1/audio/speech``。
+  默认 ``base_url=https://api.siliconflow.cn/v1``，模型 ``FunAudioLLM/CosyVoice2-0.5B``。
+  主持人与讲解人用两套系统预置音色（默认 alex / anna）。
+* ``EdgeTTSEngine``：``edge-tts``（免费、无需 Key），带逐说话人韵律。
+* ``SapiTTSEngine``：Windows 内置 SAPI，完全离线。
+* ``SineTTSEngine``：静音占位，保证音频产物链路不为空。
+* ``NullTTSEngine``：``tts_mode=off``，或某个被点名的后端缺失时，只留字幕与脚本。
 """
 
 from __future__ import annotations
@@ -71,6 +76,73 @@ def split_sentences(text: str) -> List[str]:
     """按中文/英文句末标点切句，保留标点；用于逐句设计韵律。"""
     parts = [p.strip() for p in _SENTENCE_END.split(text or "") if p.strip()]
     return parts or ([text.strip()] if text.strip() else [])
+
+
+# SiliconFlow CosyVoice2 系统预置音色（文档：male alex/benjamin/charles/david，
+# female anna/bella/claire/diana）。请求时必须带模型前缀，例如
+# ``FunAudioLLM/CosyVoice2-0.5B:alex``。
+SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
+SILICONFLOW_MODEL = "FunAudioLLM/CosyVoice2-0.5B"
+DEFAULT_VOICE_HOST = f"{SILICONFLOW_MODEL}:alex"        # 沉稳男声 · 主持人
+DEFAULT_VOICE_EXPLAINER = f"{SILICONFLOW_MODEL}:anna"   # 沉稳女声 · 讲解人
+DEFAULT_CHUNK_CHARS = 400
+
+
+def qualify_cloud_voice(voice: str, model: str, default_name: str) -> str:
+    """把 ``alex`` 补成 ``Model:alex``；空值或 edge-tts 神经音色回退到默认预置音色。"""
+    v = str(voice or "").strip()
+    if not v or "Neural" in v or v.lower().startswith("zh-"):
+        return f"{model}:{default_name}"
+    if ":" in v:
+        return v
+    return f"{model}:{v}"
+
+
+def chunk_for_speech(text: str, limit: int = DEFAULT_CHUNK_CHARS) -> List[str]:
+    """口语化之后按句切块，保证单次请求不超过 ``limit`` 个字符。
+
+    SiliconFlow 的 ``input`` 上限很大，但长对白一次送进去既容易超时，也听不出换气。
+    这里沿用按句累积、超长再硬切的方式。
+    """
+    spoken = speechify(text)
+    if not spoken:
+        return []
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = DEFAULT_CHUNK_CHARS
+    limit = max(40, limit)
+    if len(spoken) <= limit:
+        return [spoken]
+    chunks: List[str] = []
+    buf = ""
+    for sent in split_sentences(spoken):
+        if len(sent) > limit:
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            for i in range(0, len(sent), limit):
+                piece = sent[i:i + limit].strip()
+                if piece:
+                    chunks.append(piece)
+            continue
+        if buf and len(buf) + len(sent) > limit:
+            chunks.append(buf)
+            buf = sent
+        else:
+            buf = f"{buf}{sent}" if buf else sent
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
+def _scrub_key(text: str, secret: str) -> str:
+    """错误信息里绝不回显 API Key。"""
+    out = str(text or "")
+    secret = str(secret or "")
+    if secret and secret in out:
+        out = out.replace(secret, "***")
+    return out
 
 
 def _adjust_rate(rate: str, delta: int) -> str:
@@ -485,6 +557,11 @@ class SineTTSEngine(TTSEngine):
 
     name = "placeholder"
 
+    def available(self) -> bool:
+        # 占位引擎没有外部依赖。若不标成可用，FallbackTTSEngine 会跳过它，
+        # 「edge → sapi → 占位」这条链的最后一环就永远走不到。
+        return True
+
     def synthesize(self, turns: List[Dict[str, str]], out_path: Path) -> Optional[str]:
         _, total = self.build_srt(turns)
         out_path = out_path.with_name(out_path.stem + "_placeholder.wav")
@@ -535,7 +612,8 @@ class FallbackTTSEngine(TTSEngine):
         reasons: List[str] = []
         for eng in self.engines:
             if not eng.available():
-                reasons.append("[%s] 不可用" % eng.name)
+                detail = "；".join(eng.warnings) if eng.warnings else "不可用"
+                reasons.append("[%s] %s" % (eng.name, detail))
                 continue
             res = eng.synthesize(turns, out_path)
             if res:
@@ -553,9 +631,138 @@ class FallbackTTSEngine(TTSEngine):
 
 
 # --------------------------------------------------------------------------- #
+class OpenAICompatSpeechEngine(TTSEngine):
+    """OpenAI 兼容 ``POST {base_url}/audio/speech``（SiliconFlow / 自建端点）。
+
+    长对白按句切块后逐段请求，MP3 帧自包含，直接拼接。任一片段失败就整段放弃，
+    让外层 Fallback 换下一个后端，避免云端半成品和本地语音拼在同一个文件里。
+    """
+
+    name = "openai_speech"
+
+    def __init__(self, config: Optional[Dict] = None) -> None:
+        cfg = dict(config or {})
+        api_key = str(cfg.pop("api_key", "") or "")
+        super().__init__(cfg)
+        self.api_key = api_key
+        self.base_url = str(cfg.get("base_url") or SILICONFLOW_BASE_URL).rstrip("/")
+        if self.base_url.endswith("/audio/speech"):
+            self.base_url = self.base_url[: -len("/audio/speech")].rstrip("/")
+        self.model = str(cfg.get("model") or SILICONFLOW_MODEL)
+        self.voice_a = qualify_cloud_voice(str(cfg.get("voice") or ""), self.model, "alex")
+        self.voice_b = qualify_cloud_voice(str(cfg.get("voice_alt") or ""), self.model, "anna")
+        self.response_format = str(cfg.get("response_format") or "mp3")
+        try:
+            self.timeout = float(cfg.get("timeout") or 120)
+        except (TypeError, ValueError):
+            self.timeout = 120.0
+        try:
+            self.chunk_chars = int(cfg.get("chunk_chars") or DEFAULT_CHUNK_CHARS)
+        except (TypeError, ValueError):
+            self.chunk_chars = DEFAULT_CHUNK_CHARS
+        self.chunk_chars = max(40, self.chunk_chars)
+
+    def available(self) -> bool:
+        return bool(self.api_key and self.base_url)
+
+    def _voice_for(self, speaker: Optional[str]) -> str:
+        return self.voice_a if (speaker or "A").upper().startswith("A") else self.voice_b
+
+    def _one(self, text: str, voice: str) -> bytes:
+        import urllib.error
+        import urllib.request
+
+        payload = {
+            "model": self.model,
+            "input": text,
+            "voice": voice,
+            "response_format": self.response_format,
+        }
+        req = urllib.request.Request(
+            f"{self.base_url}/audio/speech",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as fh:  # noqa: S310
+                data = fh.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "ignore")[:240]
+            raise RuntimeError(f"HTTP {exc.code}: {_scrub_key(body, self.api_key)}") from exc
+        except Exception as exc:
+            raise RuntimeError(_scrub_key(f"{type(exc).__name__}: {exc}", self.api_key)) from exc
+        if not data:
+            raise RuntimeError("云端 TTS 返回空音频")
+        return data
+
+    def synthesize(self, turns: List[Dict[str, str]], out_path: Path) -> Optional[str]:
+        if not self.available():
+            self.warnings.append("未配置 TTS API Key，跳过云端语音合成")
+            return None
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        chunks: List[bytes] = []
+        voiced = 0
+        for turn in turns:
+            pieces = chunk_for_speech(turn.get("text") or "", self.chunk_chars)
+            if not pieces:
+                continue
+            voice = self._voice_for(turn.get("speaker"))
+            for piece in pieces:
+                try:
+                    chunks.append(self._one(piece, voice))
+                except Exception as exc:
+                    self.warnings.append("云端 TTS 失败：%s" % _scrub_key(str(exc), self.api_key))
+                    return None
+            voiced += 1
+        if not chunks:
+            self.warnings.append("云端 TTS 无有效对白")
+            return None
+        with out_path.open("wb") as fh:
+            for blob in chunks:
+                fh.write(blob)
+        self.turns_voiced = voiced
+        return str(out_path)
+
+
+class SiliconFlowTTSEngine(OpenAICompatSpeechEngine):
+    """SiliconFlow CosyVoice2。默认地址与模型固定，音色仍可配置。"""
+
+    name = "siliconflow"
+
+    def __init__(self, config: Optional[Dict] = None) -> None:
+        cfg = dict(config or {})
+        cfg.setdefault("base_url", SILICONFLOW_BASE_URL)
+        cfg.setdefault("model", SILICONFLOW_MODEL)
+        super().__init__(cfg)
+
+
+def _cloud_wanted(mode: str, provider: str, has_key: bool) -> bool:
+    """有 Key 的 auto，或被点名的云端模式，才把 SiliconFlow 放在链首。"""
+    if mode in ("off", "edge", "sapi") or provider in ("off", "edge"):
+        return False
+    if mode in ("siliconflow", "openai_speech") or provider in (
+        "siliconflow", "openai_speech", "custom",
+    ):
+        return True
+    return bool(has_key)
+
+
+# --------------------------------------------------------------------------- #
 def get_tts(refresh: bool = False) -> TTSEngine:
+    """按当前配置组装引擎。
+
+    ``refresh`` 只表示「按进程内最新 Settings 重新组装」。不要在这里
+    ``get_settings(refresh=True)``：那会从磁盘重读，把设置页刚写入内存、尚未落盘的 Key 冲掉。
+    """
+    del refresh  # 见文档字符串；保留参数以兼容调用方
     settings = get_settings()
-    mode = settings.tts_mode
+    mode = (settings.tts_mode or "auto").lower()
+    provider = (getattr(settings, "tts_provider", None) or "auto").lower()
     cfg = {
         "voice_a": settings.tts_voice_a,
         "voice_b": settings.tts_voice_b,
@@ -577,21 +784,39 @@ def get_tts(refresh: bool = False) -> TTSEngine:
         "sapi_question_pitch": getattr(settings, "tts_sapi_question_pitch", ""),
         "sapi_volume": getattr(settings, "tts_sapi_volume", ""),
         "sapi_break_ms": getattr(settings, "tts_sapi_break_ms", 450),
+        "api_key": getattr(settings, "tts_api_key", "") or "",
+        "base_url": getattr(settings, "tts_base_url", "") or SILICONFLOW_BASE_URL,
+        "model": getattr(settings, "tts_model", "") or SILICONFLOW_MODEL,
+        "voice": getattr(settings, "tts_voice", "") or "",
+        "voice_alt": getattr(settings, "tts_voice_alt", "") or "",
+        "timeout": getattr(settings, "tts_timeout", 120),
+        "chunk_chars": getattr(settings, "tts_chunk_chars", DEFAULT_CHUNK_CHARS),
     }
+    local_cfg = {k: v for k, v in cfg.items() if k != "api_key"}
 
-    if mode == "off":
-        return NullTTSEngine(cfg, reason="TTS 已被配置关闭（tts_mode=off）")
+    if mode == "off" or provider == "off":
+        return NullTTSEngine(local_cfg, reason="TTS 已被配置关闭（tts_mode=off）")
 
-    edge = EdgeTTSEngine(cfg)
+    edge = EdgeTTSEngine(local_cfg)
     if mode == "edge":
         # 显式要求 edge：不静默换后端，缺失就如实报缺
         return edge if edge.available() else NullTTSEngine(
-            cfg, reason="配置要求 edge-tts，但未安装：pip install edge-tts")
+            local_cfg, reason="配置要求 edge-tts，但未安装：pip install edge-tts")
 
-    sapi = SapiTTSEngine(cfg)
+    sapi = SapiTTSEngine(local_cfg)
     if mode == "sapi":
         return sapi if sapi.available() else NullTTSEngine(
-            cfg, reason="配置要求系统语音（sapi），但当前平台没有可用的 PowerShell/SAPI")
+            local_cfg, reason="配置要求系统语音（sapi），但当前平台没有可用的 PowerShell/SAPI")
 
-    # auto：edge（音质最好）→ 系统语音 sapi（完全离线）→ 静音占位（保证音频链路非空）
-    return FallbackTTSEngine([edge, sapi, SineTTSEngine(cfg)])
+    local: List[TTSEngine] = [edge, sapi, SineTTSEngine(local_cfg)]
+    has_key = bool(cfg["api_key"])
+    if _cloud_wanted(mode, provider, has_key):
+        generic = mode == "openai_speech" or provider in ("openai_speech", "custom")
+        cloud: TTSEngine = (OpenAICompatSpeechEngine if generic else SiliconFlowTTSEngine)(cfg)
+        if not cloud.available():
+            cloud.warnings.append("未配置 TTS API Key，跳过云端语音合成")
+        # 云端失败（无 Key 或 HTTP 错误）时，沿用本地链并记下原因
+        return FallbackTTSEngine([cloud, *local])
+
+    # 无 Key 的 auto：edge → 系统语音 sapi → 静音占位
+    return FallbackTTSEngine(local)

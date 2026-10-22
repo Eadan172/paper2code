@@ -418,8 +418,8 @@ def _artifacts_from_disk(pdir: Path, key: str) -> Dict[str, Any]:
         }
         if not audio:
             got_missing = ("复用阶段 explain 时**没有找到音频产物**（上次运行没生成出 podcast.mp3）。"
-                           "常见原因是 edge-tts 的免费朗读接口被服务端拒绝（实测 403 WSServerHandshakeError）；"
-                           "重新运行且**不勾「续跑」**会重试合成，届时原因会写进 warnings。")
+                           "有 SiliconFlow Key 时会优先走云端；否则常见原因是 edge-tts 的免费朗读接口被服务端拒绝"
+                           "（实测 403 WSServerHandshakeError）。重新运行且**不勾「续跑」**会重试合成，届时原因会写进 warnings。")
             got["_missing_audio_warning"] = got_missing
         return got if (got["courseware"] or got["podcast_script"] or audio) else {}
 

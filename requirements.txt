@@ -16,8 +16,9 @@ pdfplumber>=0.11           # PDF 表格（对网格线表格更稳）
 matplotlib>=3.8            # 图表 PNG 渲染（缺失时自动使用内置纯 SVG 渲染器）
 numpy>=1.24                # 仅部分示意脚本使用
 
-# --- 讲解：知识播客语音（免费、免 API Key） ---
-edge-tts>=6.1              # 缺失时仅产出脚本与 SRT 字幕
+# --- 讲解：知识播客语音 ---
+# 有 P2C_TTS_API_KEY / configs/api_keys.yaml 时优先 SiliconFlow（标准库 urllib，无需额外包）。
+edge-tts>=6.1              # 无 Key 或云端失败时的免费回退；再失败则 Windows SAPI / 静音占位
 
 # --- 本地 Web UI ---
 fastapi>=0.110

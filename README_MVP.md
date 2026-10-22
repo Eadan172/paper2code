@@ -59,7 +59,7 @@ outputs/single/<id>/mvp/
 ## 7. 安全提醒
 
 - **你上传的 zip 里 `configs/api_keys.yaml` 含有真实的 LLM 与 TTS Key**（尽管文件已被 gitignore，压缩包是整个目录打的）。请**立即轮换这两个 Key**；本包没有读取或使用它们，工作副本里已删除该文件。今后分享代码请排除 `configs/api_keys.yaml`、`.venv/`、`.work/`、`outputs/`、`incoming/`。
-- **凭据放哪儿**：写进 `configs/api_keys.yaml`（`.gitignore` 与 `tools/pack_repo.py` 都排除它，且**代码真的会读它**——这是本轮修的一个坏约定：以前这个文件被排除，但没人读它，放进去等于没放）。优先级：命令行 > 环境变量 > `api_keys.yaml` > `default.yaml` > 内置默认值；填了 `llm_api_key` 会自动切到 openai 模式，但 `--offline` 仍压过它。
+- **凭据放哪儿**：写进 `configs/api_keys.yaml`（`.gitignore` 与 `tools/pack_repo.py` 都排除它，且**代码真的会读它**——这是本轮修的一个坏约定：以前这个文件被排除，但没人读它，放进去等于没放）。优先级：命令行 > 环境变量 > `api_keys.yaml` > `default.yaml` > 内置默认值；填了 `llm_api_key` 会自动切到 openai 模式，但 `--offline` 仍压过它。播客语音的 SiliconFlow Key 写在同一个文件的 `tts_api_key`（或环境变量 `P2C_TTS_API_KEY`）；没填就继续走 edge-tts → 系统语音 → 静音占位。说明见 `docs/SiliconFlow-TTS模型.md`。
 - **接真实端点前先预检**：`python -m paper2code llm-check`（只花一次调用，打印延迟与用量；失败时打印**真实原因**——降级路径会把原始 HTTP 报错写进 warnings，这个命令会把它捞出来）。预检过了再 `python -m paper2code eval --llm`。
 - 本功能会**执行模型生成的代码**。roadmap M4 已落地的三层防护：①**静态扫描**（`paper2code/safety.py`）在执行前拦下 `os.system`/`subprocess`/`socket`/`ctypes`/`multiprocessing`、读写工作目录之外、读家目录的代码，命中即**不执行**并记录理由；②**容器执行器**（`sandbox_mode=container`）默认无网络、根文件系统只读、只挂载工作目录、CPU/内存/pids/墙钟时间都有上限；③**执行日志 + 产物哈希**落在 `.work/exec_logs/`，每次运行可事后审计。
 - `sandbox_mode` 默认仍是 `local`（本机进程，**低隔离 / 高风险**：只有超时与独立工作目录）。任务会让你选「强制容器」还是「默认本地、可选容器」；CLI 与 Web 页面都会把当前隔离级别与风险**如实显示**。`--no-run` 只生成不执行；Web 端在非容器模式下必须勾选「我确认在本机运行生成的代码」才会放行（后端 409 拦截）。

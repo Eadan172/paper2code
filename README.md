@@ -104,7 +104,7 @@ outputs/single/<paper_id>/
 │   ├── courseware.md              # 可编辑的讲解大纲
 │   ├── podcast_script.md          # 双人播客脚本
 │   ├── podcast.srt                # 字幕
-│   ├── podcast.mp3                # 音频（edge-tts；缺失时降级并说明）
+│   ├── podcast.mp3                # 音频（有 Key 时 SiliconFlow；否则 edge-tts / SAPI / 占位）
 │   └── podcast_meta.md
 └── reproduce/
     ├── repro_plan.json            # 复现计划（纯数据，可被其他执行器消费）
@@ -141,7 +141,7 @@ paper2code/
 ├── explain/               讲解层
 │   ├── courseware.py        自包含 HTML 课件渲染
 │   └── podcast.py           脚本 → SRT → 音频
-├── tts/                   语音合成适配层（edge-tts / 降级）
+├── tts/                   语音合成（SiliconFlow → edge-tts → SAPI → 占位）
 ├── reproduce/             复现层
 │   ├── classifier.py        三情形判定（带证据留痕）
 │   ├── planner.py           复现计划
@@ -197,7 +197,11 @@ PDF 抽取出来的文本里藏着大量不可见字符，它们是复现链路�
   `cost_max_calls` / `cost_max_tokens` / `cost_max_seconds` 控制（`0` = 不限制）；超限即停用 LLM 路径
   并降级为离线脚手架，且把触发原因写进 `warnings` 与报告的「成本护栏」一节——绝不静默超支；
   用量在 `mvp/mvp_result.json` 的 `usage` 里可查；
-* **TTS**：默认用 `edge-tts`（免费、免 Key，需要联网）；完全离线时会产出字幕与脚本并给出说明；
+* **TTS**：配置了 SiliconFlow Key 时优先走 CosyVoice2（`POST {base}/audio/speech`，默认
+  `https://api.siliconflow.cn/v1` + `FunAudioLLM/CosyVoice2-0.5B`，主持人 `alex`、讲解人 `anna`）。
+  Key 来自环境变量 `P2C_TTS_API_KEY`、gitignore 的 `configs/api_keys.yaml`，或 Dashboard 设置页；
+  接口和日志不回传明文。无 Key 或云端失败时按 **edge-tts → Windows SAPI → 静音占位** 回退，
+  原因写入 `warnings`。音色与配置见 `docs/SiliconFlow-TTS模型.md`。
 * **PDF 章节切分**：真实 PDF 没有 `#` 标记，章节识别依赖编号式标题与版面启发式，
   准确率低于 Markdown 输入（实测 5 页 PDF 识别出 4 个章节）。精修需引入字体/字号分析或 MinerU；
 * **伪代码翻译覆盖率**：规则翻译器不可能覆盖全部写法，翻不动的行会被注释掉
@@ -232,6 +236,8 @@ python -m paper2code serve --no-reload         # 关闭热更新（默认是开�
 
 > 想用真实模型：把凭据写进 **`configs/api_keys.yaml`**（该文件已被 `.gitignore` 与打包脚本排除，
 > 代码会真的读它；`llm_api_key` 一填就会自动切到 openai 模式）。先 `llm-check` 预检，再 `eval --llm`。
+> 播客要接近真人声：在同一文件填 `tts_api_key`（SiliconFlow），或导出 `P2C_TTS_API_KEY`。
+> 复制 `configs/api_keys.yaml.example` 即可，不要把真实 Key 提交进仓库。
 
 > M6 起，每篇论文的产物里多一份 **`VERIFICATION.md`**：把「论文每条主张 → 证据 → 状态
 > （已复现/部分/不可复现/未检验）」逐条列出来。**回放论文自带数字一律记「未检验」**——

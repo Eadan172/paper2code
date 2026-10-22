@@ -15,15 +15,23 @@
 * ``GET  /api/runs``           列出全部运行
 * ``GET  /api/runs/{pid}``     单个运行的 manifest
 * ``POST /api/run``            提交一篇论文（同步执行，MVP 简化处理）
+* ``GET  /api/tts/status``     TTS 状态（不含密钥）
+* ``POST /api/tts/settings``   应用 TTS 设置（可选写入 gitignore 的 api_keys.yaml）
+* ``POST /api/tts/test``       短句语音探测（不返回密钥）
+* ``POST /api/tts/generate``   为已有播客稿合成语音
 """
 
 from __future__ import annotations
 
 import json
+import re
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .config import get_settings
+from .config import apply_tts_runtime, get_settings, tts_status
 from .ingest import KIND_LABELS, classify_source, paper_id_for_source
 from .pipeline import list_runs
 from .progress import read_snapshot
@@ -73,6 +81,209 @@ def confirm_required() -> str:
     return ("执行沙箱为「%s」（%s，风险：%s）。运行生成的论文代码 = 在本机执行任意代码，"
             "请先确认；或把 sandbox_mode 设为 container 使用容器隔离。"
             % (pol.mode, pol.isolation, "高" if pol.risk == "high" else "低"))
+
+
+_PAPER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$")
+
+
+def _validate_paper_id(paper_id: str) -> str:
+    pid = (paper_id or "").strip()
+    if not pid or ".." in pid or not _PAPER_ID_RE.match(pid):
+        raise ValueError("非法 paper_id")
+    return pid
+
+
+def _scrub_secret(text: str, secret: str = "") -> str:
+    """响应与错误文本里去掉 API Key。"""
+    out = str(text or "")
+    st = get_settings()
+    secrets = [secret, getattr(st, "tts_api_key", "") or "", getattr(st, "llm_api_key", "") or ""]
+    for item in secrets:
+        if item and item in out:
+            out = out.replace(item, "***")
+    return out
+
+
+def _looks_like_filepath_key(value: str) -> bool:
+    """避免把配置文件路径粘进 Key 输入框。"""
+    s = (value or "").strip().strip('"').strip("'")
+    if not s:
+        return False
+    lower = s.lower().replace("\\", "/")
+    if lower.endswith((".yaml", ".yml", ".json", ".env", ".toml", ".ini")):
+        return True
+    if "/" in lower and not (s.startswith("sk-") or s.startswith("sk-or-") or s.startswith("Bearer ")):
+        return True
+    return False
+
+
+def _maybe_apply_tts(
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    voice: Optional[str] = None,
+    voice_alt: Optional[str] = None,
+    mode: Optional[str] = None,
+    persist: bool = False,
+) -> None:
+    """只应用非空字段。空字符串 = 沿用已有 Key，不会把它擦掉。"""
+    key = api_key if (api_key is not None and str(api_key).strip()) else None
+    if key is not None and _looks_like_filepath_key(key):
+        key = None
+    url = base_url if (base_url is not None and str(base_url).strip()) else None
+    mdl = model if (model is not None and str(model).strip()) else None
+    prov = provider if (provider is not None and str(provider).strip()) else None
+    voi = voice if (voice is not None and str(voice).strip()) else None
+    alt = voice_alt if (voice_alt is not None and str(voice_alt).strip()) else None
+    md = mode if (mode is not None and str(mode).strip()) else None
+    if key is None and url is None and mdl is None and prov is None and voi is None and alt is None and md is None and not persist:
+        return
+    apply_tts_runtime(
+        api_key=key, base_url=url, model=mdl, provider=prov,
+        voice=voi, voice_alt=alt, mode=md, persist=persist,
+    )
+
+
+def _parse_script_turns(script_text: str) -> List[Dict[str, str]]:
+    turns: List[Dict[str, str]] = []
+    for ln in (script_text or "").splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = re.match(r"^\*\*【(主持人|讲解人)】\*\*\s*(.*)$", s)
+        if not m:
+            m = re.match(r"^【(主持人|讲解人)】\s*(.*)$", s)
+        if m:
+            spk = "A" if m.group(1) == "主持人" else "B"
+            turns.append({"speaker": spk, "text": m.group(2).strip()})
+    return turns
+
+
+def _ping_tts(timeout: float = 30.0) -> Dict[str, Any]:
+    """向 ``/audio/speech`` 发一句「测试」。响应里没有 API Key。"""
+    st = get_settings()
+    provider = (getattr(st, "tts_provider", None) or st.tts_mode or "auto").lower()
+    key = getattr(st, "tts_api_key", "") or ""
+    base = (getattr(st, "tts_base_url", "") or "https://api.siliconflow.cn/v1").rstrip("/")
+    model = getattr(st, "tts_model", "") or "FunAudioLLM/CosyVoice2-0.5B"
+    voice = getattr(st, "tts_voice", "") or f"{model}:alex"
+
+    if provider == "edge" or (not key and provider in ("auto", "edge", "")):
+        try:
+            import asyncio
+
+            import edge_tts  # type: ignore
+
+            async def _edge_ping() -> None:
+                comm = edge_tts.Communicate("测试", voice=st.tts_voice_a or "zh-CN-XiaoxiaoNeural")
+                n = 0
+                async for _chunk in comm.stream():
+                    n += 1
+                    if n >= 2:
+                        break
+
+            t0 = time.perf_counter()
+            try:
+                asyncio.run(_edge_ping())
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(_edge_ping())
+                finally:
+                    loop.close()
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            return {"ok": True, "latency_ms": latency_ms, "model": "edge-tts", "mode": "edge"}
+        except Exception as exc:
+            if not key:
+                return {
+                    "ok": False,
+                    "error": "未配置 TTS API Key；edge-tts 探测也失败：" + _scrub_secret(str(exc), key),
+                    "mode": "edge",
+                }
+
+    if not key:
+        return {"ok": False, "error": "请填写 TTS API Key（或改用 edge-tts）", "mode": provider or "siliconflow"}
+
+    payload = {
+        "model": model,
+        "input": "测试",
+        "voice": voice,
+        "response_format": "mp3",
+    }
+    req = urllib.request.Request(
+        f"{base}/audio/speech",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key}",
+        },
+        method="POST",
+    )
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as fh:  # noqa: S310
+            audio = fh.read(64)
+            try:
+                fh.read()
+            except Exception:
+                pass
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        return {
+            "ok": True,
+            "latency_ms": latency_ms,
+            "model": model,
+            "mode": provider or "siliconflow",
+            "bytes_preview": len(audio),
+        }
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "ignore")[:300]
+        body = _scrub_secret(body, key)
+        return {"ok": False, "error": f"HTTP {exc.code}: {body}", "model": model, "mode": provider or "siliconflow"}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": _scrub_secret(f"{type(exc).__name__}: {exc}", key),
+            "model": model,
+            "mode": provider or "siliconflow",
+        }
+
+
+def synthesize_podcast_file(paper_id: str) -> Dict[str, Any]:
+    """为已有播客稿合成音频。返回体不含 API Key。"""
+    pid = _validate_paper_id(paper_id)
+    st = get_settings()
+    explain = Path(st.output_dir) / pid / "explain"
+    script = explain / "podcast_script.md"
+    if not script.exists():
+        raise FileNotFoundError(f"未找到播客稿：{pid}/explain/podcast_script.md")
+    turns = _parse_script_turns(script.read_text(encoding="utf-8"))
+    if len(turns) < 2:
+        raise ValueError("播客稿无法解析为对白轮次")
+    from .tts import get_tts
+
+    engine = get_tts()
+    out_audio = explain / "podcast.mp3"
+    path = engine.synthesize(turns, out_audio)
+    status = tts_status()
+    warnings = [_scrub_secret(w) for w in (engine.warnings or [])]
+    if not path:
+        return {
+            "ok": False,
+            "error": _scrub_secret("；".join(warnings) or "语音合成失败"),
+            "engine": engine.name,
+            "warnings": warnings,
+            **status,
+        }
+    rel = f"{pid}/explain/{Path(path).name}"
+    return {
+        "ok": True,
+        "engine": engine.name,
+        "audio": rel,
+        "url": f"/files/{rel}",
+        "warnings": warnings,
+        **status,
+    }
 
 
 if _HAS_FASTAPI:
@@ -312,6 +523,71 @@ if _HAS_FASTAPI:
         return {"ok": True, "paper_id": paper_id, "job": job, "progress": snap,
                 "tasks": [t.to_dict() for t in tasks[:5]]}
 
+    class TtsSettingsRequest(BaseModel):
+        api_key: Optional[str] = None
+        base_url: Optional[str] = None
+        model: Optional[str] = None
+        provider: Optional[str] = None
+        voice: Optional[str] = None
+        voice_alt: Optional[str] = None
+        mode: Optional[str] = None
+        persist: bool = True
+
+    class TtsGenerateRequest(BaseModel):
+        paper_id: str
+        api_key: Optional[str] = None
+        base_url: Optional[str] = None
+        model: Optional[str] = None
+        provider: Optional[str] = None
+        voice: Optional[str] = None
+        voice_alt: Optional[str] = None
+        persist: bool = False
+
+    @app.get("/api/tts/status")
+    def api_tts_status() -> Dict[str, Any]:
+        return tts_status()
+
+    @app.post("/api/tts/settings")
+    def api_tts_settings(req: TtsSettingsRequest) -> Dict[str, Any]:
+        _maybe_apply_tts(
+            req.api_key, req.base_url, req.model, req.provider, req.voice,
+            req.voice_alt, req.mode, persist=bool(req.persist),
+        )
+        return {"ok": True, **tts_status()}
+
+    @app.post("/api/tts/test")
+    def api_tts_test(req: TtsSettingsRequest) -> Dict[str, Any]:
+        """短句探测。成功后才按 persist 落盘，避免把打错的 Key 写进文件。"""
+        _maybe_apply_tts(
+            req.api_key, req.base_url, req.model, req.provider, req.voice,
+            req.voice_alt, req.mode, persist=False,
+        )
+        result = _ping_tts(timeout=30.0)
+        if result.get("ok") and req.persist is not False:
+            _maybe_apply_tts(
+                req.api_key, req.base_url, req.model, req.provider, req.voice,
+                req.voice_alt, req.mode, persist=True,
+            )
+            result.update(tts_status())
+        return result
+
+    @app.post("/api/tts/generate")
+    def api_tts_generate(req: TtsGenerateRequest) -> Any:
+        """按当前 TTS 设置为已有播客稿合成语音。响应不含密钥。"""
+        _maybe_apply_tts(
+            req.api_key, req.base_url, req.model, req.provider, req.voice,
+            req.voice_alt, persist=bool(req.api_key),
+        )
+        try:
+            result = synthesize_podcast_file(req.paper_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not result.get("ok"):
+            return JSONResponse(status_code=400, content=result)
+        return result
+
     @app.get("/", response_class=HTMLResponse)
     def dashboard() -> str:
         return _DASHBOARD_HTML
@@ -363,8 +639,8 @@ h1{font-size:31px;font-weight:800;letter-spacing:-.02em}
 h1 span{background:linear-gradient(120deg,var(--brand),var(--brand2),var(--accent));-webkit-background-clip:text;background-clip:text;color:transparent}
 .sub{color:var(--muted);margin-top:8px;font-size:14.5px}
 .submit{display:flex;gap:10px;margin:22px 0 30px;flex-wrap:wrap}
-input[type=text]{flex:1;min-width:280px;padding:12px 15px;border:1px solid var(--line);border-radius:12px;font-size:14.5px;background:#fff}
-input[type=text]:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px rgba(79,107,237,.12)}
+input[type=text],input[type=password]{flex:1;min-width:220px;padding:12px 15px;border:1px solid var(--line);border-radius:12px;font-size:14.5px;background:#fff}
+input[type=text]:focus,input[type=password]:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px rgba(79,107,237,.12)}
 button{padding:12px 22px;border:none;border-radius:12px;background:linear-gradient(135deg,var(--brand),var(--brand2));
 color:#fff;font-size:14.5px;font-weight:650;cursor:pointer;transition:.16s}
 button:hover{transform:translateY(-1px);box-shadow:0 8px 22px rgba(79,107,237,.3)}
@@ -429,6 +705,25 @@ background:#fbfcff;margin:12px 0 6px;font-size:13.8px;cursor:pointer;transition:
   <h1>paper2code · <span>论文学习工具</span></h1>
   <div class="sub">提交论文 → 自动生成讲解材料（课件 / 知识播客）与复现结果（表格与图表重现）。支持链接 / 本机路径 / 上传文件，支持单篇与批量。</div>
 </header>
+<div class="panel" id="ttsPanel">
+  <h4>语音 · SiliconFlow CosyVoice2</h4>
+  <div class="hint">配置了 Key 就用云端音色（默认主持人 alex、讲解人 anna）。没 Key 或调用失败时自动退回 edge-tts → Windows 语音 → 静音占位。Key 只留在本进程或 gitignore 的 <code>configs/api_keys.yaml</code>，接口不回传明文。</div>
+  <div class="submit" style="margin:12px 0 0">
+    <select id="ttsProvider" style="padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:#fff;font-size:14px">
+      <option value="auto">自动（有 Key 用 SiliconFlow）</option>
+      <option value="siliconflow">只用 SiliconFlow（失败再回退）</option>
+      <option value="edge">只用 edge-tts</option>
+    </select>
+    <input type="password" id="ttsKey" placeholder="SiliconFlow API Key（已保存则留空）" autocomplete="off"/>
+  </div>
+  <div class="submit" style="margin:8px 0 0">
+    <input type="text" id="ttsVoice" placeholder="主持人 FunAudioLLM/CosyVoice2-0.5B:alex"/>
+    <input type="text" id="ttsVoiceAlt" placeholder="讲解人 FunAudioLLM/CosyVoice2-0.5B:anna"/>
+    <button type="button" id="ttsTest" class="ghost">测试连接</button>
+    <button type="button" id="ttsSave" class="ghost">保存到本机</button>
+  </div>
+  <div class="hint" id="ttsStatus"></div>
+</div>
 <div id="banner"></div>
 <div class="tabs">
   <button data-tab="single" class="on">① 单篇提交</button>
@@ -501,6 +796,7 @@ async function load(){
     if(ex&&ex.courseware)links+='<a href="/files/'+pid+'/explain/courseware.html" target="_blank">📊 课件</a>';
     if(ex&&ex.podcast_audio)links+='<a href="/files/'+pid+'/explain/'+esc(base(ex.podcast_audio))+'" target="_blank">🎧 播客音频</a>';
     if(ex&&ex.podcast_script)links+='<a href="/view?p='+encodeURIComponent(pid+'/explain/podcast_script.md')+'" target="_blank">📝 播客稿</a>';
+    if(ex&&ex.podcast_script)links+='<button type="button" class="qbtn" data-tts="'+esc(pid)+'">重新合成语音</button>';
     if(rp&&rp.report_html)links+='<a href="/files/'+pid+'/reproduce/repro_report.html" target="_blank">🔬 复现报告</a>';
     else if(rp&&rp.report)links+='<a href="/view?p='+encodeURIComponent(pid+'/reproduce/repro_report.md')+'" target="_blank">🔬 复现报告</a>';
     if(rp&&rp.tech_guide)links+='<a href="/view?p='+encodeURIComponent(pid+'/reproduce/TECH_GUIDE.md')+'" target="_blank">📘 技术说明书</a>';
@@ -530,6 +826,7 @@ async function load(){
       +(ck.fail?tag('fail '+ck.fail,' fail'):'')
       +'</div><div class="links">'+links+'</div>'+modRow+'</div>';
   }).join('');
+  grid.querySelectorAll('[data-tts]').forEach(b=>{b.onclick=()=>regenTts(b.getAttribute('data-tts'))});
   grid.querySelectorAll('[data-mod]').forEach(b=>{b.onclick=()=>modifyMvp(b.getAttribute('data-mod'))});
   grid.querySelectorAll('[data-vers]').forEach(b=>{b.onclick=()=>showVersions(b.getAttribute('data-vers'))});
   grid.querySelectorAll('[data-del]').forEach(b=>{b.onclick=()=>deleteRun(b.getAttribute('data-del'))});
@@ -791,6 +1088,82 @@ document.getElementById('pdfs').onchange=async()=>{
   bt.textContent='已上传 '+ok+' 个文件（已入队）'+(bad.length?('；失败 '+bad.length+'：'+bad.join('；')):'');
   loadQueue();
 };
+function ttsPayload(persist){
+  const prov=document.getElementById('ttsProvider').value;
+  const body={provider:prov, persist:!!persist};
+  body.mode = prov==='edge' ? 'edge' : (prov==='siliconflow' ? 'siliconflow' : 'auto');
+  const k=document.getElementById('ttsKey').value.trim(); if(k) body.api_key=k;
+  const v=document.getElementById('ttsVoice').value.trim(); if(v) body.voice=v;
+  const a=document.getElementById('ttsVoiceAlt').value.trim(); if(a) body.voice_alt=a;
+  return body;
+}
+function paintTts(d, ok){
+  const el=document.getElementById('ttsStatus');
+  if(!el) return;
+  el.style.color=ok?'var(--pass)':'var(--fail)';
+  el.textContent=d;
+}
+async function loadTts(){
+  try{
+    const s=await (await fetch('/api/tts/status')).json();
+    const prov=document.getElementById('ttsProvider');
+    if(s.mode==='edge'||s.provider==='edge') prov.value='edge';
+    else if(s.mode==='siliconflow'||s.provider==='siliconflow') prov.value='siliconflow';
+    else prov.value='auto';
+    if(s.voice) document.getElementById('ttsVoice').value=s.voice;
+    if(s.voice_alt) document.getElementById('ttsVoiceAlt').value=s.voice_alt;
+    const key=document.getElementById('ttsKey');
+    key.value='';
+    if(s.has_key){
+      key.placeholder='已保存'+(s.key_hint?' '+s.key_hint:'')+'，留空继续使用';
+      paintTts('已从 '+(s.key_source_label||'本机')+' 加载'+(s.key_hint?' · '+s.key_hint:'')+' · '+(s.model||''), true);
+    }else{
+      paintTts('未配置 TTS Key · 将使用 edge-tts / 系统语音 / 静音占位', false);
+      document.getElementById('ttsStatus').style.color='var(--muted)';
+    }
+  }catch(e){ paintTts('读取 TTS 状态失败：'+e, false); }
+}
+document.getElementById('ttsTest').onclick=async()=>{
+  const btn=document.getElementById('ttsTest');
+  btn.disabled=true; paintTts('测试中…', true); document.getElementById('ttsStatus').style.color='var(--muted)';
+  try{
+    const r=await fetch('/api/tts/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(ttsPayload(true))});
+    const d=await r.json();
+    if(d.ok){
+      document.getElementById('ttsKey').value='';
+      if(d.key_hint) document.getElementById('ttsKey').placeholder='已保存 '+d.key_hint+'，留空继续使用';
+      paintTts('连接成功 · '+(d.latency_ms||'?')+' ms · '+(d.model||d.mode||'')+(d.key_hint?' · '+d.key_hint:''), true);
+    }else paintTts('测试失败：'+(d.error||JSON.stringify(d)), false);
+  }catch(e){ paintTts('测试失败：'+e, false); }
+  btn.disabled=false;
+};
+document.getElementById('ttsSave').onclick=async()=>{
+  const btn=document.getElementById('ttsSave');
+  btn.disabled=true; paintTts('保存中…', true);
+  try{
+    const r=await fetch('/api/tts/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(ttsPayload(true))});
+    const d=await r.json();
+    if(d.ok){
+      document.getElementById('ttsKey').value='';
+      if(d.key_hint) document.getElementById('ttsKey').placeholder='已保存 '+d.key_hint+'，留空继续使用';
+      paintTts('已保存 · '+(d.provider||'')+' · '+(d.model||'')+(d.has_key?(' · '+(d.key_hint||'已配置 Key')):' · 无 Key'), true);
+    }else paintTts(d.error||JSON.stringify(d), false);
+  }catch(e){ paintTts('保存失败：'+e, false); }
+  btn.disabled=false;
+};
+async function regenTts(pid){
+  const ht=document.getElementById('htoast');
+  if(ht) ht.textContent='正在合成语音…';
+  try{
+    const r=await fetch('/api/tts/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paper_id:pid})});
+    const d=await r.json();
+    if(d.ok){
+      if(ht) ht.textContent='语音已生成（'+((d.engine)||'')+'）';
+      load();
+    }else if(ht) ht.textContent='合成失败：'+(d.error||d.detail||'');
+  }catch(e){ if(ht) ht.textContent='合成失败：'+e; }
+}
+loadTts();
 loadQueue();
 load();
 </script></body></html>

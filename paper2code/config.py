@@ -6,7 +6,9 @@ YAML 为可选依赖，缺失时静默跳过。
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -16,6 +18,13 @@ ROOT = Path(__file__).resolve().parent.parent
 #: 凭据叠加层文件名。``.gitignore`` 与 ``tools/pack_repo.py`` 都把它当凭据文件排除，
 #: 所以这里必须真的读它——否则「把 Key 放这个文件」这条约定就是坏的（会静默不生效）。
 API_KEYS_FILE = "configs/api_keys.yaml"
+API_KEYS_EXAMPLE = "configs/api_keys.yaml.example"
+
+_SOURCE_LABEL = {
+    "file": "configs/api_keys.yaml",
+    "env": "环境变量",
+    "memory": "本进程内存",
+}
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -32,6 +41,12 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
         return {}
 
 
+def _api_keys_path() -> Path:
+    """凭据文件路径。测试可把 ``API_KEYS_FILE`` 指到临时绝对路径。"""
+    p = Path(API_KEYS_FILE)
+    return p if p.is_absolute() else (ROOT / p)
+
+
 def _load_api_keys() -> Dict[str, Any]:
     """读 ``configs/api_keys.yaml``（**凭据文件**，已被 gitignore 与打包脚本排除）。
 
@@ -39,7 +54,7 @@ def _load_api_keys() -> Dict[str, Any]:
     ``命令行 > 环境变量 > api_keys.yaml > default.yaml > 内置默认值``。
     这样「把 Key 写进 gitignored 的文件」既能生效，又不会被提交出去。
     """
-    return _load_yaml(ROOT / API_KEYS_FILE)
+    return _load_yaml(_api_keys_path())
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -79,7 +94,19 @@ class Settings:
     cost_max_seconds: int = 600       # 累计耗时上限（秒）
 
     # -- 语音 -------------------------------------------------------------- #
-    tts_mode: str = "auto"  # auto | edge | off
+    # auto：有 TTS Key 时 SiliconFlow 优先，失败再 edge → sapi → 占位
+    # siliconflow / openai_speech：点名云端（仍会在调用失败时回退本地链）
+    # edge / sapi：只用该本地后端；off：关闭
+    tts_mode: str = "auto"
+    tts_provider: str = "auto"  # auto | siliconflow | openai_speech | edge | custom
+    tts_api_key: str = ""
+    tts_base_url: str = "https://api.siliconflow.cn/v1"
+    tts_model: str = "FunAudioLLM/CosyVoice2-0.5B"
+    # CosyVoice2 系统预置：alex 沉稳男声（主持人）/ anna 沉稳女声（讲解人）
+    tts_voice: str = "FunAudioLLM/CosyVoice2-0.5B:alex"
+    tts_voice_alt: str = "FunAudioLLM/CosyVoice2-0.5B:anna"
+    tts_timeout: float = 120
+    tts_chunk_chars: int = 400
     tts_voice_a: str = "zh-CN-YunxiNeural"
     tts_voice_b: str = "zh-CN-XiaoxiaoNeural"
     # 逐说话人韵律 / 问句语调 / 轮次间停顿：让双人对谈不再「同一个腔调念稿」
@@ -203,6 +230,18 @@ class Settings:
             inst.llm_model = os.environ["P2C_LLM_MODEL"]
         if os.environ.get("P2C_TTS_MODE"):
             inst.tts_mode = os.environ["P2C_TTS_MODE"]
+        if os.environ.get("P2C_TTS_PROVIDER"):
+            inst.tts_provider = os.environ["P2C_TTS_PROVIDER"]
+        if os.environ.get("P2C_TTS_API_KEY"):
+            inst.tts_api_key = os.environ["P2C_TTS_API_KEY"]
+        if os.environ.get("P2C_TTS_BASE_URL"):
+            inst.tts_base_url = os.environ["P2C_TTS_BASE_URL"]
+        if os.environ.get("P2C_TTS_MODEL"):
+            inst.tts_model = os.environ["P2C_TTS_MODEL"]
+        if os.environ.get("P2C_TTS_VOICE"):
+            inst.tts_voice = os.environ["P2C_TTS_VOICE"]
+        if os.environ.get("P2C_TTS_VOICE_ALT"):
+            inst.tts_voice_alt = os.environ["P2C_TTS_VOICE_ALT"]
         if os.environ.get("P2C_SANDBOX_MODE"):
             inst.sandbox_mode = os.environ["P2C_SANDBOX_MODE"]
         if os.environ.get("P2C_SANDBOX_IMAGE"):
@@ -322,6 +361,7 @@ class Settings:
         for k, v in self.__dict__.items():
             out[k] = str(v) if isinstance(v, Path) else v
         out["llm_api_key"] = "***" if self.llm_api_key else ""
+        out["tts_api_key"] = "***" if self.tts_api_key else ""
         return out
 
 
@@ -339,3 +379,160 @@ def get_settings(refresh: bool = False, **overrides: Any) -> Settings:
 def set_settings(settings: Settings) -> None:
     global _settings
     _settings = settings
+
+
+def _key_hint(secret: str) -> str:
+    """把密钥显示成 ``••••`` + 末 4 位。绝不返回原文。"""
+    s = str(secret or "").strip()
+    if not s:
+        return ""
+    tail = re.sub(r"[^A-Za-z0-9]", "", s)[-4:]
+    return f"••••{tail}" if tail else "已保存"
+
+
+def _file_secret(field: str) -> str:
+    return str(_load_api_keys().get(field) or "").strip()
+
+
+def _yaml_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return json.dumps("" if value is None else str(value), ensure_ascii=False)
+
+
+def _example_keys_path() -> Path:
+    p = Path(API_KEYS_EXAMPLE)
+    return p if p.is_absolute() else (ROOT / p)
+
+
+def persist_api_keys(updates: Dict[str, Any]) -> Path:
+    """把非空字段合并进 ``configs/api_keys.yaml``（gitignore）。空值跳过，避免把已有 Key 擦掉。"""
+    clean: Dict[str, Any] = {}
+    for key, raw in (updates or {}).items():
+        if raw is None:
+            continue
+        val = str(raw).strip()
+        if not val:
+            continue
+        if key in ("tts_base_url", "llm_base_url"):
+            val = val.rstrip("/")
+            if key == "tts_base_url" and val.endswith("/audio/speech"):
+                val = val[: -len("/audio/speech")].rstrip("/")
+        clean[key] = val
+    path = _api_keys_path()
+    if not clean:
+        return path
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = ""
+    if path.exists():
+        text = path.read_text(encoding="utf-8")
+    elif _example_keys_path().exists():
+        text = _example_keys_path().read_text(encoding="utf-8")
+    if not text.strip():
+        text = "# paper2code 专用密钥文件（请勿提交）\n"
+
+    found: set = set()
+    out_lines: List[str] = []
+    for line in text.splitlines():
+        m = re.match(r"^(\s*)([A-Za-z_][\w]*)\s*:", line)
+        if m and m.group(2) in clean:
+            name = m.group(2)
+            comment = ""
+            rest = line.split(":", 1)[1]
+            hash_at = rest.find(" #")
+            if hash_at >= 0:
+                comment = rest[hash_at:]
+            out_lines.append(f"{m.group(1)}{name}: {_yaml_scalar(clean[name])}{comment}")
+            found.add(name)
+            continue
+        out_lines.append(line)
+    missing = [k for k in clean if k not in found]
+    if missing:
+        if out_lines and out_lines[-1].strip():
+            out_lines.append("")
+        for name in missing:
+            out_lines.append(f"{name}: {_yaml_scalar(clean[name])}")
+    path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _tts_key_source(st: Settings) -> str:
+    if not st.tts_api_key:
+        return ""
+    if os.environ.get("P2C_TTS_API_KEY"):
+        return "env"
+    if _file_secret("tts_api_key"):
+        return "file"
+    return "memory"
+
+
+def apply_tts_runtime(
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    voice: Optional[str] = None,
+    voice_alt: Optional[str] = None,
+    mode: Optional[str] = None,
+    persist: bool = False,
+) -> Settings:
+    """更新进程内 TTS 设置。空字符串忽略（留空 = 继续用已有 Key）。
+
+    ``persist=True`` 时把非空字段写入 gitignore 的 ``configs/api_keys.yaml``。
+    不会把 ``tts_mode=auto`` 改写成 ``siliconflow``：有 Key 时由 ``get_tts`` 把云端放在链首，
+    调用失败仍能退回 edge → sapi → 占位。
+    """
+    st = get_settings()
+    if api_key is not None and str(api_key).strip():
+        st.tts_api_key = str(api_key).strip()
+    if base_url is not None and str(base_url).strip():
+        url = str(base_url).strip().rstrip("/")
+        if url.endswith("/audio/speech"):
+            url = url[: -len("/audio/speech")].rstrip("/")
+        st.tts_base_url = url
+    if model is not None and str(model).strip():
+        st.tts_model = str(model).strip()
+    if provider is not None and str(provider).strip():
+        st.tts_provider = str(provider).strip()
+    if voice is not None and str(voice).strip():
+        st.tts_voice = str(voice).strip()
+    if voice_alt is not None and str(voice_alt).strip():
+        st.tts_voice_alt = str(voice_alt).strip()
+    if mode is not None and str(mode).strip():
+        st.tts_mode = str(mode).strip()
+    set_settings(st)
+    if persist:
+        persist_api_keys(
+            {
+                "tts_api_key": st.tts_api_key,
+                "tts_base_url": st.tts_base_url,
+                "tts_model": st.tts_model,
+                "tts_provider": st.tts_provider,
+                "tts_voice": st.tts_voice,
+                "tts_voice_alt": st.tts_voice_alt,
+                "tts_mode": st.tts_mode,
+            }
+        )
+    return st
+
+
+def tts_status(settings: Optional[Settings] = None) -> Dict[str, Any]:
+    """对外 TTS 状态。不含原始 Key。"""
+    st = settings or get_settings()
+    source = _tts_key_source(st)
+    return {
+        "provider": st.tts_provider,
+        "mode": st.tts_mode,
+        "base_url": st.tts_base_url,
+        "model": st.tts_model,
+        "voice": st.tts_voice,
+        "voice_alt": st.tts_voice_alt,
+        "has_key": bool(st.tts_api_key),
+        "key_hint": _key_hint(st.tts_api_key),
+        "key_source": source,
+        "key_source_label": _SOURCE_LABEL.get(source, ""),
+        "persisted": source == "file",
+    }
