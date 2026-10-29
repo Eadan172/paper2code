@@ -322,7 +322,8 @@ def _run_open_source(paper: Paper, out_dir: Path, infos: Dict[str, dataset.Datas
     manifest_path = repo.write_manifest(manifest, out_dir, extra={"decision": decision.to_dict()})
     extra["repo_manifest"] = manifest_path
 
-    run_script = repo.build_run_script(manifest, python_exe="python", seed=seed)
+    run_script = repo.build_run_script(
+        manifest, python_exe="python", seed=seed, script_dir=out_dir)
     script_path = out_dir / "repro_run.sh"
     script_path.write_text(run_script, encoding="utf-8")
     extra["repro_run_script"] = str(script_path)

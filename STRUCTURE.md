@@ -19,7 +19,7 @@
 | `outputs/single/` | 单篇测试输出（2 篇 + `index.json`） | 谨慎 | 否（gitignore） |
 | `outputs/batch/patch2/` | 批量测试输出（19 篇 + `index.json`） | 谨慎 | 否（gitignore） |
 | `outputs/eval/` | 评测输出（基线、榜单、review sheet、`_runs/`、各轮子目录） | 谨慎 | 否（gitignore） |
-| `example/` | **演示案例**：仅 `output/` 复现结果（原文 PDF 在论文目录内） | 不能（用于上传） | 是 |
+| `example/` | 示例说明（`README.md`）。完整跑产物不入库 | 可以 | 仅 README |
 | `local_docs/research/` | 调研方案文档（总体方案、改进清单、诊断方案、文献清单） | 可整体归档 | 否（gitignore） |
 | `local_docs/archive/` | 历史清理记录、语料清单、一次性分析脚本 | 可整体归档 | 否（gitignore） |
 | `docs/` | 代码相关文档：`eval_baseline.md`、`mvp_baseline.md` | 不能 | 是 |
@@ -118,32 +118,24 @@ outputs/single/Estimating-Absolute-Protein-Protein-Binding-Free-Energies-by-a-Su
 判断某篇跑没跑完：看对应输出目录下 `progress.json` 的 `stages[].status`；
 `failed` / `running` 就是没跑完，用 `--resume` 续跑。
 
-## 六、演示案例 `example/`
+## 六、示例
 
-`example/` 顶层严格只有一项：`output/`，即完整复现结果。原文 PDF 随结果一起
-放在论文目录内，不再保留独立的 demo 代码副本。
+可提交的小示例在 `samples/`（评测 L1 与 CLI 都用它）。`example/README.md` 只说明这个约定。
 
-```
-example/
-└── output/Estimating-.../
-    ├── paper.pdf                   ← 原文 PDF（演示输入，随结果保存）
-    ├── manifest.json               ← 总清单（相对路径）
-    ├── paper.json / paper.md       ← 结构化论文对象
-    ├── explain/                    ← 课件 HTML、播客稿、字幕、音频
-    ├── reproduce/                  ← 复现报告、图表、数据、绘制脚本
-    └── mvp/                        ← MVP demo、图表说明、notebook
+完整流水线产物写到 gitignore 的 `outputs/`。`example/output/` 同样不入库：
+那是本机跑出来的转储（PDF、音频、图、安装脚本）。历史上曾提交过一篇完整复现结果，
+其中的安装脚本带有本机绝对路径，已从版本库删除。
+
+```bash
+python -m paper2code run samples/01_open_source --llm offline
 ```
 
-运行演示改用根目录的 `start_demo.bat`：
+产物在 `outputs/single/<paper_id>/`。分享脚本时用相对该目录的路径，不要写入盘符路径。
 
 ```bat
-start_demo.bat                 :: 起 Web UI，浏览器里上传 example/output/.../paper.pdf
+start_demo.bat                 :: 起 Web UI，在浏览器里上传一篇论文 PDF
 start_demo.bat --offline       :: 离线模式（零 Key、不联网）
 ```
-
-`output/` 内路径均为相对路径（源 PDF 为 `./paper.pdf`，产物为 `./explain/...`）；
-失败的 `reproduce/repo` 克隆未包含，`repo_manifest.json` 已标记 `exists: false`。
-`output/` 内不放任何运行时缓存、临时目录或绝对路径。
 
 > 原 `example/code/`（框架副本、两个演示脚本、配置、`start_demo.bat`）已移出
 > `example/`，归档在 `local_docs/archive/example_code_20261022/code/`；根目录
@@ -175,8 +167,8 @@ python -m paper2code run samples\01_open_source --llm offline
 ## 八、本地文档与清理约定
 
 - `local_docs/` 已加入 `.gitignore`，调研方案与历史归档不会上传 GitHub。
-- `tests/inputs/single/`、`tests/inputs/batch/` 已加入 `.gitignore`；19 篇批量 PDF 来自
-  `E:\cc\git_work\paper2code\v2.0\test-patch\patch2` 的恢复副本。
+- `tests/inputs/single/`、`tests/inputs/batch/` 已加入 `.gitignore`。19 篇批量 PDF 只放在本机的
+  `tests/inputs/batch/`，不入库。
 - **不要删**：`configs/api_keys.yaml`、`samples/`、`_test_paper/`、
   `tests/inputs/`、`outputs/single/`、`outputs/batch/patch2/`、`outputs/eval/`。
 - 可重新生成：`outputs/eval`、`.work/tasks.db`（丢失任务历史）、`__pycache__`。

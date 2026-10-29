@@ -52,6 +52,9 @@ def main() -> int:
             if not p.is_file():
                 continue
             rel = p.relative_to(ROOT)
+            if rel.as_posix().startswith("example/output/"):
+                dropped_files += 1
+                continue
             hit_dir = next((d for d in rel.parts if d in EXCLUDE_DIRS), None)
             if hit_dir:
                 dropped_dirs.add(hit_dir)
