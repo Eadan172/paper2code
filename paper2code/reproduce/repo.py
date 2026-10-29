@@ -137,12 +137,47 @@ def venv_python(venv_dir: Path) -> Path:
     return venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
+_DRIVE_PREFIX = re.compile(r"^([A-Za-z]:)(/|$)")
+
+
+def _script_relative(base: Path, target: Path) -> Optional[str]:
+    """``target`` 相对 ``base`` 的 POSIX 路径。
+
+    跨盘符、或以盘符 / UNC 开头的结果返回 ``None``，调用方改用占位相对路径，
+    避免把本机盘符路径写进可提交的脚本。
+    """
+    b = str(base).replace("\\", "/")
+    t = str(target).replace("\\", "/")
+    b_drive = _DRIVE_PREFIX.match(b)
+    t_drive = _DRIVE_PREFIX.match(t)
+    if b_drive or t_drive:
+        if not (b_drive and t_drive and b_drive.group(1).lower() == t_drive.group(1).lower()):
+            return None
+        b = b[len(b_drive.group(1)):] or "/"
+        t = t[len(t_drive.group(1)):] or "/"
+        if not b.startswith("/"):
+            b = "/" + b
+        if not t.startswith("/"):
+            t = "/" + t
+        rel = os.path.relpath(t, b).replace("\\", "/")
+    else:
+        try:
+            rel = Path(os.path.relpath(Path(target), Path(base))).as_posix()
+        except ValueError:
+            return None
+    if rel.startswith("/") or rel.startswith("//") or _DRIVE_PREFIX.match(rel):
+        return None
+    return rel
+
+
 def write_install_scripts(out_dir: Path, venv_dir: Path, specs: Sequence[str],
                           pip_index: str = "") -> Dict[str, str]:
     """落一份可人工执行的安装脚本 + 锁定清单（**不执行**）。
 
     自动安装默认关闭；即使关闭，也要让用户能一键复现同一套依赖，
     而不是只看到一句「缺少依赖」。
+
+    脚本里的 venv 与 lock 路径相对脚本自身，不写入本机绝对路径。
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -151,24 +186,31 @@ def write_install_scripts(out_dir: Path, venv_dir: Path, specs: Sequence[str],
 
     index_ps = (" -i %s" % pip_index) if pip_index else ""
     py = venv_python(Path(venv_dir))
+    venv_rel = _script_relative(out, Path(venv_dir)) or "venv"
+    py_rel = _script_relative(out, py) or (
+        "venv/Scripts/python.exe" if os.name == "nt" else "venv/bin/python")
+    lock_rel = _script_relative(out, lock) or "requirements.lock.txt"
     ps1 = out / "install_env.ps1"
     ps1.write_text(
         "$ErrorActionPreference = 'Stop'\n"
-        "python -m venv \"%s\"\n"
-        "& \"%s\" -m pip install --no-input -r \"%s\"%s\n"
-        % (Path(venv_dir), py, lock, index_ps),
+        "$Root = Split-Path -Parent $MyInvocation.MyCommand.Path\n"
+        "python -m venv (Join-Path $Root '%s')\n"
+        "& (Join-Path $Root '%s') -m pip install --no-input -r (Join-Path $Root '%s')%s\n"
+        % (venv_rel.replace("/", "\\"), py_rel.replace("/", "\\"),
+           lock_rel.replace("/", "\\"), index_ps),
         encoding="utf-8",
     )
     sh = out / "install_env.sh"
-    py_sh = py.as_posix()
     sh.write_text(
-        "#!/usr/bin/env sh\nset -e\n"
-        "python -m venv \"%s\"\n"
-        "\"%s\" -m pip install --no-input -r \"%s\"%s\n"
-        % (Path(venv_dir).as_posix(), py_sh, lock.as_posix(), index_ps),
+        "#!/usr/bin/env sh\n"
+        "set -e\n"
+        "ROOT=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"\n"
+        "python -m venv \"$ROOT/%s\"\n"
+        "\"$ROOT/%s\" -m pip install --no-input -r \"$ROOT/%s\"%s\n"
+        % (venv_rel, py_rel, lock_rel, index_ps),
         encoding="utf-8",
     )
-    return {"lock": str(lock), "ps1": str(ps1), "sh": str(sh)}
+    return {"lock": lock_rel, "ps1": "install_env.ps1", "sh": "install_env.sh"}
 
 
 def provision_venv(venv_dir: Path, specs: Sequence[str], pip_index: str = "",
@@ -372,11 +414,28 @@ def introspect(root: Path | str) -> RepoManifest:
     return m
 
 
-def build_run_script(manifest: RepoManifest, python_exe: str = "python", seed: int = 0) -> str:
-    """生成 ``repro_run.sh``：隔离环境 → 固定种子 → 执行入口。"""
+def build_run_script(manifest: RepoManifest, python_exe: str = "python", seed: int = 0,
+                     script_dir: Optional[Path] = None) -> str:
+    """生成 ``repro_run.sh``：隔离环境 → 固定种子 → 执行入口。
+
+    ``REPO_DIR`` 默认相对本脚本（通常是旁边的 ``repo/``）。跨盘符时退回
+    ``./repo``，由调用方用环境变量 ``REPO_DIR`` 覆盖，不把本机绝对路径写进脚本。
+    """
     req = manifest.requirements_files[0] if manifest.requirements_files else ""
     entry = manifest.entrypoints[0] if manifest.entrypoints else "<请指定入口脚本>"
     data_hint = ", ".join(manifest.data_files[:5]) if manifest.data_files else "无"
+    repo_rel = "repo"
+    repo_note = ""
+    root_text = (manifest.root or "").strip()
+    if script_dir is not None and root_text:
+        rel = _script_relative(Path(script_dir), Path(root_text))
+        if rel and rel != ".":
+            repo_rel = rel
+        elif rel == ".":
+            repo_rel = "."
+        else:
+            repo_note = ("# checkout is not relative to this script; "
+                         "default is ./repo (override with REPO_DIR)")
 
     lines = [
         "#!/usr/bin/env bash",
@@ -386,7 +445,15 @@ def build_run_script(manifest: RepoManifest, python_exe: str = "python", seed: i
         "# ============================================================",
         "set -euo pipefail",
         "",
-        f'REPO_DIR="${{REPO_DIR:-{manifest.root or "$(pwd)"}}}"',
+        'SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"',
+    ]
+    if repo_note:
+        lines.append(repo_note)
+    if repo_rel == ".":
+        lines.append('REPO_DIR="${REPO_DIR:-$SCRIPT_DIR}"')
+    else:
+        lines.append('REPO_DIR="${REPO_DIR:-"$SCRIPT_DIR/%s"}"' % repo_rel)
+    lines += [
         'WORK_DIR="${WORK_DIR:-$PWD/.p2c_repro}"',
         "",
         'echo "[1/5] 创建工作目录 $WORK_DIR"',

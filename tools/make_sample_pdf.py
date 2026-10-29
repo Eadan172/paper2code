@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -25,16 +26,22 @@ META = 10.5
 LEADING_RATIO = 1.28
 MARGIN = 54.0
 
-_FONT_CANDIDATES = [
-    r"C:\Windows\Fonts\arial.ttf",
-    r"C:\Windows\Fonts\segoeui.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/System/Library/Fonts/Supplemental/Arial.ttf",
-]
+def _font_candidates() -> list[str]:
+    """系统字体探测。Windows 字体目录跟 ``WINDIR``，不写死盘符。"""
+    found: list[str] = []
+    windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot") or ""
+    if windir:
+        fonts = Path(windir) / "Fonts"
+        found.extend([str(fonts / "arial.ttf"), str(fonts / "segoeui.ttf")])
+    found.extend([
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ])
+    return found
 
 
 def _pick_font() -> str | None:
-    for cand in _FONT_CANDIDATES:
+    for cand in _font_candidates():
         if Path(cand).exists():
             return cand
     return None

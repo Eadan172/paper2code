@@ -5,7 +5,7 @@
 
 # 评测基线（python -m paper2code eval）
 
-- 评测集：`E:\WorkBuddy\paper2code\configs\eval_set.json`（v1，2026-10-20）
+- 评测集：`configs/eval_set.json`（v1，2026-10-20）
 - 运行时间：2026-10-20T09:06:01 ｜ 端点：离线（`offline-scaffold`，0 token）｜ 沙箱：`local`（执行前静态扫描；离线路径的确定性生成物标记 trusted）
 
 ## 一、总体（**分层报告，禁止只看平均**）

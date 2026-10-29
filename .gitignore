@@ -17,6 +17,8 @@ __pycache__/
 .workbuddy/
 outputs/
 incoming/
+# 本机复现转储（小示例在 samples/；完整产物在 outputs/）
+example/output/
 local_docs/
 .trae-html-share-packages/
 

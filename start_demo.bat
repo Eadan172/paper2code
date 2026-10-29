@@ -67,7 +67,7 @@ echo        请任选一种方式装依赖，然后重新双击本文件：
 echo          a. 复用已有解释器:  python -m pip install -r requirements.txt
 echo          b. 建干净虚拟环境:  python -m venv .venv
 echo                              .venv\Scripts\pip install -r requirements.txt
-echo          c. 直接指定解释器:  set P2C_PYTHON=D:\path\to\python.exe
+echo          c. 直接指定解释器:  set P2C_PYTHON=^<path-to-python.exe^>
 echo.
 pause
 exit /b 3
